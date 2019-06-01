@@ -11,7 +11,6 @@
 #include <mxml.h>
 #include <glib.h>
 #include <zfp.h>
-#include <omp.h>
 
 // see if we have MPI or other tools
 #include "config.h"
@@ -32,8 +31,11 @@
 
 #define MAXLEVEL 10
 #define MAX_NODE_DEGREE 100
+#define ARR_LEN(array, length){length = sizeof(array)/sizeof(array[0]);}
 //#define DUMP_FEATURE
 //#define TEST_REDUCTION
+#define CANOPUS
+//#define CANOPUS_1D
 
 static char *io_method[MAXLEVEL]; //the IO methods for data output for each level
 static char *io_parameters[MAXLEVEL]; //the IO method parameters
@@ -102,6 +104,7 @@ int
 compress (double * array, int nx, double tolerance,
           double ** array_compressed)
 {
+    double start_time = MPI_Wtime ();
     zfp_type type;     /* array scalar type */
     zfp_field* field;  /* array meta data */
     zfp_stream* zfp;   /* compressed stream */
@@ -142,7 +145,9 @@ compress (double * array, int nx, double tolerance,
     stream_close (stream);
 
     * array_compressed = (double *) buffer;
-
+    
+    double end_time = MPI_Wtime ();
+    printf ("Compression time = %f\n", end_time - start_time);
     return zfpsize;
 }
 
@@ -745,7 +750,7 @@ int adios_sirius_adaptive_open (struct adios_file_struct * fd
                     //it for the time being
                     mkdir (io_paths[l], 0700);
                 }
-                md->level[l].filename = malloc (strlen(io_paths[l]) + strlen(fd->name) + 1);
+                md->level[l].filename = malloc (strlen(io_paths[l]) + strlen(fd->name) + 2);
                 sprintf (md->level[l].filename, "%s/%s", io_paths[l], fd->name);
                 convert_file_mode (fd->mode, mode);
                
@@ -1268,7 +1273,7 @@ int intersect (int ** conn, int n1, int n2, int * n3_list)
     return c;
 }
 
-void prep_mesh (int ** conn, int nvertices, int nvertices_new)
+void prep_mesh (int ** conn, int nvertices)
                 
 {
     for (int i = 0; i < nvertices; i++)
@@ -1388,6 +1393,7 @@ int build_mesh (int ** conn, int nvertices, int nvertices_new,
             int n1 = i, n2 = conn[i][j];
 
             len = intersect (conn, n1, n2, n3_list);
+
             if (len > 0)
             {
                 for (k = 0; k < len; k++)
@@ -1406,12 +1412,21 @@ int build_mesh (int ** conn, int nvertices, int nvertices_new,
                     if (g_hash_table_insert (ght, key_str, 0) == TRUE)
                     {
                         * (mesh + lastcell * 3) = n1 - to_offset (nodes_cut, nvertices - nvertices_new, n1);
-;
+
+
                         * (mesh + lastcell * 3 + 1) = n2 - to_offset (nodes_cut, nvertices - nvertices_new, n2);
 
                         * (mesh + lastcell * 3 + 2) = n3 - to_offset (nodes_cut, nvertices - nvertices_new, n3);
-; 
-                        lastcell++; 
+
+ 
+                        lastcell++;
+                        if (lastcell > nmesh)
+                        {
+                            printf ("The decimated mesh is larger than the orignal mesh. This for example, can be caused the following case.\n");
+                            printf("<82466,20432,82470>, <82466,19974,82469>, <82466,20432,82467>, <82466,19974,82440>.  Since 82466 is connected to 19974, 20432, and 19974 is connected to 20432, my code is thinking there is one more triangle <82466,19974,20432>, and adds it to the decimated mesh, which makes the decimated mesh larger than the original mesh.\n");
+                            printf ("For now, either increase the memeory allocation of the new mesh, int * mesh = malloc (nmesh * 3 * 4), or increase the decimation ratio.\n");
+                            assert (lastcell <= nmesh); //force quit
+                        }
                     }
                 }
             }
@@ -1428,6 +1443,22 @@ int build_mesh (int ** conn, int nvertices, int nvertices_new,
     * mesh_new = mesh;
 
     return lastcell;
+}
+
+
+int update_nnodes_cut (int ** conn, int nvertices)
+{
+    int next = 0;
+
+    for (int i = 0; i < nvertices; i++)
+    {
+        if (conn[i][0] == -1)
+        {
+            next++;
+        }
+    }
+
+    return next;
 }
 
 int * build_nodes_cut_list (int ** conn, int nvertices, int nvertices_new)
@@ -1478,7 +1509,11 @@ void build_field (int ** conn, int nvertices, int nvertices_new, int * nodes_cut
         field_new += elems_to_cp;
 
         off += elems_to_cp + 1;
-        prev = nodes_cut[i] + 1;
+
+        if (i < nvertices - nvertices_new)
+        {
+            prev = nodes_cut[i] + 1;
+        }
     }
 }
 
@@ -1961,7 +1996,6 @@ double time1 = MPI_Wtime();
                 &r_idx, &z_idx);
 
 double time2 = MPI_Wtime();
-#pragma omp parallel for
     for (int m = 0; m < nmesh_new; m++)
     {
         int n1 = * (mesh_reduced + m * 3);
@@ -2001,7 +2035,100 @@ printf ("get delta time = %f\n", time3 - time1);
     * pfield_delta = delta;
 }
 
+void get_psnr (double * fieldorg, double * MSE_o, int nvertices, int nvertices_new, double *psnr )
+{
+    double * field;
+    double * mse_o;
+    double MSEtemp=0.0;
+    double MSE=0.0;
+    double MAX=0.0;
+    double psnr_o=0.0;
+    int loopend=0;
+    field = (double *)malloc (nvertices * 8);
+    assert(field);
+    mse_o = (double *)malloc (nvertices *8);
+    assert(mse_o);
+
+    memcpy(field, fieldorg, nvertices *8);
+    memcpy(mse_o, MSE_o, nvertices *8);
+#ifdef CANOPUS
+    loopend=nvertices;
+#endif
+
+#ifdef CANOPUS_1D
+    loopend=nvertices-nvertices_new;
+#endif        
+    for (int i=0; i < loopend; i++){
+        if (field[i]>MAX)
+            MAX=field[i];
+        //printf ("field[%d]=%f\n",i,field[i]);
+        //printf ("estimate_i[%d]=%f\n",i,estimate_i[i]);
+        MSEtemp=fabs(mse_o[i]);
+        //printf("MSEtemp[%d]=%e\n",i,MSEtemp);
+        MSE+=MSEtemp*MSEtemp;
+    }
+    //printf("MSE=%f",MSE);
+    MSE=(double) MSE / (double) loopend;
+    if (MSE==0) printf ("MSE=0\n");
+    psnr_o=10*log10((double)MAX*(double)MAX/(double)MSE);
+    printf("psnr=%f\n",psnr_o);
+    *psnr=psnr_o;
+    free(field);
+    free(mse_o);
+}
+
 void get_delta (double * r, double * z, double * field,
+                int nvertices, double * r_reduced, double * z_reduced,
+                double * field_reduced, int nvertices_new,
+                double ** pr_delta, double ** pz_delta, double ** pfield_delta)
+{
+    double start_time = MPI_Wtime ();
+    double * delta_r, * delta_z,* delta_field;
+    int oset = 0;
+    delta_r = (double *) malloc (nvertices * 8);
+    delta_z = (double *) malloc (nvertices * 8);
+    delta_field =(double *) malloc (nvertices * 8);
+    assert (delta_r && delta_z && delta_field);
+ 
+    double per=0;
+    for (int i = 0; i < nvertices;){
+        if ((i+dec_ratio) < nvertices)
+            for (int j = 0; j < (dec_ratio-1); j++){  
+                delta_r[i-oset+j] = r[i+1+j]-(r[i]+r[i+dec_ratio])*(j+1)/dec_ratio;
+                delta_z[i-oset+j] = z[i+1+j]-(z[i]+z[i+dec_ratio])*(j+1)/dec_ratio;
+                delta_field[i-oset+j] = field[i+1+j]-(field[i]+field[i+dec_ratio])*(j+1)/dec_ratio;
+                per = delta_field[i-oset+j]*100/((r[i]+r[i+dec_ratio])/2);
+                //if (per > 10)
+                  //  printf ("(%d) %f\n", (i-oset+j), per);
+
+               // if ((i-oset+j) >= 204204 && (i-oset+j) <= 204209)
+                 //   printf("(%d)  %.12e\n",(i-oset+j),delta[i-oset+j]);
+
+            }
+        else 
+            for (int j = 0; j < (nvertices-i-1); j++){
+                delta_r[i-oset+j] = r[i+1+j]-2*r[i]*(j+1)/dec_ratio;
+                delta_z[i-oset+j] = z[i+1+j]-2*z[i]*(j+1)/dec_ratio;
+                delta_field[i-oset+j] = field[i+1+j]-2*field[i]*(j+1)/dec_ratio; 
+                per = delta_field[i-oset+j]/r[i]; 
+               // if (per > 10)         
+                 //   printf ("(%d) %f\n", (i-oset+j), per);
+               // if ((i-oset+j) >= 204204 && (i-oset+j) <= 204209)
+               //     printf("(%d)  %.12e\n",(i-oset+j),delta[i-oset+j]);
+            }
+        i=i+dec_ratio;
+        oset=oset+1;
+    }
+    * pr_delta=delta_r;
+    * pz_delta=delta_z;
+    * pfield_delta=delta_field;
+
+    double end_time = MPI_Wtime ();
+    printf ("Get delta time = %f\n", end_time - start_time);
+}
+
+void get_delta_o (double * r, double * z, double * field,
+    
                 int nvertices, int * mesh, int nmesh,
                 double * r_reduced, double * z_reduced,
                 double * field_reduced, int nvertices_new,
@@ -2014,7 +2141,6 @@ void get_delta (double * r, double * z, double * field,
     assert (delta);
     int tid;
 
-#pragma omp parallel for
     for (int i = 0; i < nvertices; i++)
     {
 //        tid = omp_get_thread_num();
@@ -2083,14 +2209,78 @@ double calc_area (double * r, double * z, double * data,
     //printf ("ntaggedCells = %d, new surface = %f\n", ntaggedCells, surface_size);
 
 }
+void decimate (double * rorg, double * zorg, double * fieldorg, int nvertices, double ** r_reduced, double ** z_reduced, double ** field_reduced, int * nvertices_new)
+{
+    double start_time = MPI_Wtime ();
+    double * r, * z,* field;
+    double * r_new, * z_new, * field_new;
+    r = (double *) malloc (nvertices * 8);
+    z = (double *) malloc (nvertices * 8);
+    field =(double *) malloc (nvertices * 8);
+    assert (r && z && field);
+    
+    memcpy (r, rorg, nvertices * 8);
+    memcpy (z, zorg, nvertices * 8);
+    memcpy (field, fieldorg, nvertices * 8);
 
-void decimate (double * rorg, double * zorg, double * fieldorg, 
+//    while (1) {}
+   // printf ("original data:%f\n", * field );
+    printf("vertices= %d\n", nvertices);
+
+    if (nvertices % dec_ratio == 0)
+        * nvertices_new = nvertices / dec_ratio;
+    else
+        * nvertices_new = (nvertices / dec_ratio) + 1;
+
+    printf("new vertices= %d\n", * nvertices_new);
+
+    r_new = (double *) malloc ((* nvertices_new) * 8);
+    z_new = (double *) malloc ((* nvertices_new) * 8);
+    field_new = (double *) malloc ((* nvertices_new) * 8);
+    assert (r_new && z_new && field_new);
+    
+    printf("dec_ratio= %d\n", dec_ratio);
+//    int a = 0;
+//    while (a < nvertices){
+    for (int a = 0, b= 0; b < * nvertices_new;){
+        r_new[b] = r[a];
+        z_new[b] = z[a];
+        field_new[b] = field[a];
+       // printf("Reduced data:");
+       /* if(b >= 1920 && b <= 1925){
+            printf("Data:(%d)%.9e\n", b, field[a]);
+            printf("R:(%d)%.9e\n", b, r[a]);
+            printf("Z:(%d)%.9e\n", b, z[a]);
+       
+        }
+        */
+        //printf ("a=%d\n",a);
+        a = a + dec_ratio;
+        b++;
+       // printf ("a=%d \n", a);
+       // printf ("b=%d \n", b);
+    }
+    * r_reduced = r_new;
+    * z_reduced = z_new;
+    * field_reduced = field_new;
+
+    //printf("Reduced data : %f\n",  * field_new);
+
+    free (r);
+    free (z);
+    free (field);
+    double end_time = MPI_Wtime ();
+    printf ("Decimation time = %f\n", end_time - start_time);                  
+}
+
+void decimate_o (double * rorg, double * zorg, double * fieldorg, 
                int nvertices, int * mesh, int nmesh,
                double ** r_reduced, double ** z_reduced, 
                double ** field_reduced, int * nvertices_new,
                int ** mesh_reduced, int * nmesh_new
               )
 {
+    double start_time = MPI_Wtime ();
     double * r, * z, * field;
     double * r_new, * z_new, * field_new;
     int * mesh_new;
@@ -2122,7 +2312,7 @@ void decimate (double * rorg, double * zorg, double * fieldorg,
 
 double t0 = MPI_Wtime();
     while ((double)vertices_cut / (double)nvertices < (1.0 - 1.0 / dec_ratio))
-//    while (vertices_cut < 10000)
+//    while (vertices_cut < 20)
     {
         int v1 = min_idx / MAX_NODE_DEGREE;
         assert (v1 >=0 && v1 < nvertices);
@@ -2458,10 +2648,12 @@ double t2 = MPI_Wtime();
     }
 #endif
 
-    * nvertices_new = nvertices - vertices_cut;
     //printf ("nvertices_old = %d, nvertices_new = %d\n", nvertices, * nvertices_new);
 
-    prep_mesh (conn, nvertices, * nvertices_new);
+    prep_mesh (conn, nvertices);
+
+    vertices_cut = update_nnodes_cut (conn, nvertices);
+    * nvertices_new = nvertices - vertices_cut;
 
     r_new = (double *) malloc ((* nvertices_new) * 8);
     z_new = (double *) malloc ((* nvertices_new) * 8);
@@ -2499,6 +2691,8 @@ double t2 = MPI_Wtime();
     free (r);
     free (z);
     free (field);
+    double end_time = MPI_Wtime ();
+    printf ("Decimation time = %f\n", end_time - start_time);
 }
 
 void thresholding (double * r, double * z, double * field,
@@ -2710,14 +2904,17 @@ void adios_sirius_adaptive_write (struct adios_file_struct * fd
     int newsize = 0, cell_cnt = 0;
     double * r_reduced = 0, * z_reduced = 0;
     double * data_reduced = 0, * delta = 0;
-    double * delta_compr = 0;
+    double * estimate_data = 0; 
+    double * delta_compr = 0, *delta_r_compr = 0, *delta_z_compr = 0;
+    double * delta_r = 0, *delta_z = 0, *delta_data = 0;
 #ifdef TEST_REDUCTION
     double * test_field = 0;
 #endif
     int nvertices_new;
+    double psnr;
     int * mesh_reduced = 0, nmesh_reduced;
-    int compr_size = 0;
-
+    int compr_size_delta = 0, compr_size_delta_r = 0, compr_size_delta_z = 0;
+    double iotime = 0.0;
     for (l = 0; l < nlevels; l++)
     {
         if (alloc_var_struct (md, l) != err_no_error)
@@ -2817,11 +3014,14 @@ void adios_sirius_adaptive_write (struct adios_file_struct * fd
                         var->local_offsets = print_dimensions (1, offsets);
                     }
                 }
-
+               // printf ("Branch1\n");
+               // printf ("v->name=%s\n",v->name);
                 if (!strcmp (v->name, "dpot"))
-                {
+                {   
+                   // printf("Branch2\n");
                     if (l == 0)
-                    {
+                    {   
+                       // printf("Branch3\n");
                         struct adios_var_struct 
                             * mesh = adios_find_var_by_name (fd->group, "mesh");
 
@@ -2930,12 +3130,17 @@ void adios_sirius_adaptive_write (struct adios_file_struct * fd
 #endif
 
                         // Decimation for level 0
-                        decimate ((double *) R->data, (double *) Z->data, (double *) data, 
+#ifdef CANOPUS
+                        decimate_o ((double *) R->data, (double *) Z->data, (double *) data, 
                                   nelems, (int *) mesh->data, mesh_ldims[0],
                                   &r_reduced, &z_reduced, &data_reduced, 
                                   &nvertices_new, &mesh_reduced, 
                                   &nmesh_reduced
                                  );
+#endif
+#ifdef CANOPUS_1D
+                        decimate ((double *) R->data, (double *) Z->data, (double *) data, nelems, &r_reduced, &z_reduced, &data_reduced, &nvertices_new); 
+#endif 
 
                         calc_area (r_reduced, z_reduced, data_reduced,
                                    nvertices_new, mesh_reduced,
@@ -2944,7 +3149,8 @@ void adios_sirius_adaptive_write (struct adios_file_struct * fd
 
                         if (save_delta)
                         {
-                            get_delta ((double *) R->data, 
+#ifdef CANOPUS
+                            get_delta_o ((double *) R->data, 
                                        (double *) Z->data, 
                                        (double *) data,
                                        nelems, (int *) mesh->data, 
@@ -2953,14 +3159,54 @@ void adios_sirius_adaptive_write (struct adios_file_struct * fd
                                        nvertices_new, mesh_reduced, 
                                        nmesh_reduced, &delta
                                       );
+  
+                            get_psnr((double *) data, delta, nelems, nvertices_new, &psnr); 
+#endif
+#ifdef CANOPUS_1D                          
+                            get_delta ((double *) R->data,
+                                       (double *) Z->data,
+                                       (double *) data,
+                                       nelems,
+                                       r_reduced, z_reduced, data_reduced,
+                                       nvertices_new,
+                                       &delta_r, &delta_z, &delta
+                                      );
 
+                            get_psnr((double *) data, delta, nelems, nvertices_new, &psnr);
+#endif           
                             if (compress_delta)
                             {
-                                compr_size = compress (delta, 
-                                                       nelems, 
+                                compr_size_delta = compress (delta, 
+                                                       (nelems-nvertices_new), 
                                                        compr_tolerance, 
                                                        &delta_compr
                                                       );
+                                printf ("compression ratio of delta_data:%f\n",((double) (nelems-nvertices_new)*8/compr_size_delta));
+                                printf ("comression size of delta_data:%d\n", compr_size_delta);
+                                
+                                decompress (delta, (nelems-nvertices_new), compr_tolerance,
+                                            delta_compr, compr_size_delta);
+#ifdef CANOPUS_1D
+                                compr_size_delta_r = compress (delta_r,
+                                                       (nelems-nvertices_new),
+                                                       compr_tolerance,
+                                                       &delta_r_compr
+                                                      );
+                                printf ("comression size of delta_r:%d\n", compr_size_delta_r);                 
+                                decompress (delta_r, (nelems-nvertices_new), compr_tolerance,
+                                            delta_r_compr, compr_size_delta_r);
+
+                                compr_size_delta_z = compress (delta_z,
+                                                       (nelems-nvertices_new),
+                                                       compr_tolerance,
+                                                       &delta_z_compr
+                                                      );
+                                printf ("comression size of delta_z:%d\n", compr_size_delta_z);
+
+                                decompress (delta_z, (nelems-nvertices_new), compr_tolerance,
+                                            delta_z_compr, compr_size_delta_z);
+
+#endif
                             }
                         }
 #ifdef TEST_REDUCTION
@@ -2968,8 +3214,14 @@ void adios_sirius_adaptive_write (struct adios_file_struct * fd
                         {
                             if (compress_delta)
                             {
-                                decompress (delta, nelems, compr_tolerance,
-                                            delta_compr, compr_size);
+                                decompress (delta, (nelems-nvertices_new), compr_tolerance,
+                                            delta_compr, compr_size_delta);
+#ifdef CANOPUS_1D
+                                decompress (delta_r, (nelems-nvertices_new), compr_tolerance,
+                                            delta_r_compr, compr_size_delta_r);
+                                decompress (delta_z, (nelems-nvertices_new), compr_tolerance,
+                                            delta_z_compr, compr_size_delta_z);
+#endif
                             }
 
                             test_delta ((double *) R->data,
@@ -2980,6 +3232,7 @@ void adios_sirius_adaptive_write (struct adios_file_struct * fd
                                        nvertices_new, mesh_reduced, nmesh_reduced,
                                        delta, &test_field
                                       );
+ 
                         }
 #endif
                     }
@@ -3016,7 +3269,6 @@ void adios_sirius_adaptive_write (struct adios_file_struct * fd
                     var->size = 0;
                 }
             }
-
             if (var->size > 0)
             {
                 adios_common_define_var (md->level[l].grp
@@ -3036,6 +3288,7 @@ void adios_sirius_adaptive_write (struct adios_file_struct * fd
                     uint64_t new_gdims[16];
                     uint64_t new_ldims[16];
                     uint64_t new_offsets[16];
+
 #ifdef DUMP_FEATURE
                     new_gdims[0] = newsize;
                     new_ldims[0] = newsize;
@@ -3067,6 +3320,7 @@ void adios_sirius_adaptive_write (struct adios_file_struct * fd
                     new_global_dimensions = print_dimensions (1, new_gdims);
                     new_local_dimensions = print_dimensions (1, new_ldims);
                     new_local_offsets = print_dimensions (1, new_offsets);
+               
 
                     DEFINE_VAR_LEVEL("R/L1",1,adios_double);
                     DEFINE_VAR_LEVEL("Z/L1",1,adios_double);
@@ -3077,15 +3331,15 @@ void adios_sirius_adaptive_write (struct adios_file_struct * fd
                     new_local_dimensions = print_dimensions (2, new_ldims);
                     new_offsets[0] = 0;
                     new_offsets[1] = 0;
-                    new_local_offsets = print_dimensions (2, new_offsets);
-                    new_global_dimensions = "";
+                    new_local_offsets = print_dimensions (2, new_offsets);                          new_global_dimensions = "";
 
                     DEFINE_VAR_LEVEL("mesh/L1",1,adios_integer);
 
                     if (compress_delta)
-                    {
-                        new_gdims[0] = compr_size;
-                        new_ldims[0] = compr_size;
+                    {   
+                        
+                        new_gdims[0] = compr_size_delta;
+                        new_ldims[0] = compr_size_delta;
                         new_offsets[0] = 0;
                     }
                     else
@@ -3102,10 +3356,35 @@ void adios_sirius_adaptive_write (struct adios_file_struct * fd
                     if (compress_delta)
                     {
                         DEFINE_VAR_LEVEL("delta/L0",0,adios_byte);
+#ifdef CANOPUS_1D
+                        DEFINE_VAR_LEVEL("delta_r/L0",0,adios_byte);
+                        DEFINE_VAR_LEVEL("delta_z/L0",0,adios_byte);  
+#endif
                     }
                     else
                     {
                         DEFINE_VAR_LEVEL("delta/L0",0,adios_double);
+#ifdef CANOPUS_1D       
+                        DEFINE_VAR_LEVEL("delta_r/L0",0,adios_double);
+                        DEFINE_VAR_LEVEL("delta_z/L0",0,adios_double);
+#endif
+                    }
+                    
+                    if (compress_delta)
+                    { 
+                        new_gdims[0] = nelems;
+                        new_ldims[0] = nelems;
+                        new_offsets[0] = 0;
+
+                        new_global_dimensions = print_dimensions (1, new_gdims);
+                        new_local_dimensions = print_dimensions (1, new_ldims);
+                        new_local_offsets = print_dimensions (1, new_offsets);
+
+                        DEFINE_VAR_LEVEL("delta_decompressed",0,adios_double);
+#ifdef CANOPUS_1D
+                        DEFINE_VAR_LEVEL("delta_r_decompressed",0,adios_double);
+                        DEFINE_VAR_LEVEL("delta_z_decompressed",0,adios_double);
+#endif
                     }
 #ifdef TEST_REDUCTION
                     DEFINE_VAR_LEVEL("full_field/L1",1,adios_double);
@@ -3153,10 +3432,10 @@ void adios_sirius_adaptive_write (struct adios_file_struct * fd
 
                     do_write (md->level[1].fd, "Z/L1", z_reduced);
                     free (z_reduced);
-
+                  
                     do_write (md->level[1].fd, "mesh/L1", mesh_reduced);
                     free (mesh_reduced);
-
+     
                     do_write (md->level[1].fd, "dpot/L1", data_reduced);
                     free (data_reduced);
 
@@ -3165,15 +3444,33 @@ void adios_sirius_adaptive_write (struct adios_file_struct * fd
                         if (!compress_delta)
                         {
                             do_write (md->level[0].fd, "delta/L0", delta);
+#ifdef CANOPUS_1D
+                            do_write (md->level[0].fd, "delta_r/L0", delta_r);                              do_write (md->level[0].fd, "delta_z/L0", delta_z);
+#endif                           // printf("Write delta successfully!\n");
                         }
                         else
                         {
                             do_write (md->level[0].fd, "delta/L0", 
                                       delta_compr);
+                            do_write (md->level[0].fd, "delta_decompressed", delta);
+#ifdef CANOPUS_1D
+                            do_write (md->level[0].fd, "delta_r/L0",
+                                      delta_r_compr);
+                            do_write (md->level[0].fd, "delta_r_decompressed", delta_r);
+                            do_write (md->level[0].fd, "delta_z/L0",
+                                      delta_z_compr);
+                            do_write (md->level[0].fd, "delta_z_decompressed", delta_z);
+                            free (delta_r_compr);
+                            free (delta_z_compr);
+#endif
                             free (delta_compr);
                         }
 
                         free (delta);
+#ifdef CANOPUS_1D
+                        free (delta_r);
+                        free (delta_z);
+#endif
                     }
                     else
                     {
@@ -3187,9 +3484,8 @@ void adios_sirius_adaptive_write (struct adios_file_struct * fd
                 }
             }
         } // if
-
+//while (1) {}
     } // for levels
-
 }
 
 void adios_sirius_adaptive_read (struct adios_file_struct * fd

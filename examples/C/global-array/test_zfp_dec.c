@@ -136,8 +136,8 @@ int main (int argc, char ** argv)
         char fname[64];
 
         //sprintf (fname, "xgc.3d.080%02d.bp", step);
-        sprintf (fname, "data1/plane_pressure.data1.L3.bp");
-        //sprintf (fname, "larger_data/cfd_16X/plane_pressure.bp");
+        sprintf (fname, "data1/dpot.3d.08000.data1.L3.bp");
+        //sprintf (fname, "larger_data/plane_pressure.bp");
         //sprintf (fname, "xgc-f0/xgc.dataspaces.f0analysis.00005.bp");
         adios_read_init_method (method, comm, "verbose=3");
 
