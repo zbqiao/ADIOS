@@ -136,7 +136,8 @@ int main (int argc, char ** argv)
         char fname[64];
 
         //sprintf (fname, "xgc.3d.080%02d.bp", step);
-        sprintf (fname, "larger_data/xgc.3d.00480.bp");
+        sprintf (fname, "data1/plane_pressure.data1.L3.bp");
+        //sprintf (fname, "larger_data/cfd_16X/plane_pressure.bp");
         //sprintf (fname, "xgc-f0/xgc.dataspaces.f0analysis.00005.bp");
         adios_read_init_method (method, comm, "verbose=3");
 
@@ -147,7 +148,7 @@ int main (int argc, char ** argv)
             return -1;
         }
 
-        ADIOS_VARINFO * v = adios_inq_var (f, "dpot");
+        ADIOS_VARINFO * v = adios_inq_var (f, "dpot/L1");
         //ADIOS_VARINFO * v = adios_inq_var (f, "f0_f");
 
         start[0] = 0;
@@ -169,7 +170,7 @@ int main (int argc, char ** argv)
 
         /* Read a subset of the temperature array */
         sel = adios_selection_boundingbox (v->ndim, start, count);
-        adios_schedule_read (f, sel, "dpot", 0, 1, data);
+        adios_schedule_read (f, sel, "dpot/L1", 0, 1, data);
         adios_perform_reads (f, 1);
 
         adios_read_close (f);
@@ -180,9 +181,10 @@ int main (int argc, char ** argv)
         // Compress the data using ZFP
         int compressed_size = compressor (data, count[0]*count[1], tolerance, &data_compressed);
         printf ("compression ratio  = %f\n", ((double) count[0]*count[1]*8) / compressed_size);
-
+        printf ("compressed_size = %d\n", compressed_size );
         decompressor (data, count[0]*count[1], tolerance,
                       data_compressed, compressed_size);
+        while (1) {}
 
         // read mesh
         adios_read_init_method (method, comm, "verbose=3");
